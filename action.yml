@@ -1,0 +1,159 @@
+name: 'Publish macOS App to TestFlight'
+description: 'Build and upload a macOS app to TestFlight using Fastlane and App Store Connect API'
+author: 'Mifos Initiative'
+branding:
+  icon: upload
+  color: red
+
+inputs:
+  app_identifier:
+    required: true
+    description: 'Bundle identifier of the macOS app (e.g., com.example)'
+
+  cmp_desktop_dir:
+    required: true
+    description: 'Path to the macOS desktop app directory'
+
+  # Optional convenience defaults
+  keychain_name:
+    required: false
+    default: signing.keychain-db
+    description: 'Temporary keychain name used during signing (default: signing.keychain-db)'
+
+  java_version:
+    required: false
+    default: '21'
+    description: 'Java version to install (default: 21, minimum: 18)'
+
+  # Secrets (pass from the caller workflow via secrets.*)
+  keychain_password:
+    required: true
+    description: 'Password for the temporary keychain'
+
+  certificates_password:
+    required: true
+    description: 'Password for .p12 certificates'
+
+  mac_app_distribution_certificate_b64:
+    required: true
+    description: 'Base64 of Mac App Distribution .p12'
+
+  mac_installer_distribution_certificate_b64:
+    required: true
+    description: 'Base64 of Mac Installer Distribution .p12'
+
+  mac_embedded_provision_b64:
+    required: true
+    description: 'Base64 of embedded.provisionprofile'
+
+  mac_runtime_provision_b64:
+    required: true
+    description: 'Base64 of runtime.provisionprofile'
+
+  appstore_key_id:
+    required: true
+    description: 'App Store Connect API key ID'
+
+  appstore_issuer_id:
+    required: true
+    description: 'App Store Connect API issuer ID'
+
+  appstore_auth_key_b64:
+    required: true
+    description: 'Base64 of the .p8 App Store Connect API private key'
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Java
+      uses: actions/setup-java@v4
+      with:
+        distribution: temurin
+        java-version: ${{ inputs.java_version }}
+
+    - name: Set up Ruby & bundle
+      uses: ruby/setup-ruby@v1
+      with:
+        bundler-cache: true
+
+    - name: Install Fastlane dependencies
+      shell: bash
+      run: |
+        gem install bundler
+        bundler install --jobs 4 --retry 3
+
+    - name: Create & unlock temporary keychain
+      shell: bash
+      env:
+        KEYCHAIN_NAME: ${{ inputs.keychain_name }}
+        KEYCHAIN_PASSWORD: ${{ inputs.keychain_password }}
+      run: |
+        security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+        security set-keychain-settings -lut 21600 "$KEYCHAIN_NAME"
+        security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+        security list-keychains -d user -s "$KEYCHAIN_NAME"
+
+    - name: Import Mac App Distribution certificate
+      shell: bash
+      env:
+        KEYCHAIN_NAME: ${{ inputs.keychain_name }}
+        KEYCHAIN_PASSWORD: ${{ inputs.keychain_password }}
+        CERTIFICATES_PASSWORD: ${{ inputs.certificates_password }}
+        MAC_APP_DISTRIBUTION_CERTIFICATE_B64: ${{ inputs.mac_app_distribution_certificate_b64 }}
+      run: |
+        CERT="${RUNNER_TEMP}/mac_app_distribution.p12"
+        echo -n "$MAC_APP_DISTRIBUTION_CERTIFICATE_B64" | base64 -D > "$CERT"
+        security import "$CERT" -P "$CERTIFICATES_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_NAME"
+        security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+    - name: Import Mac Installer Distribution certificate
+      shell: bash
+      env:
+        KEYCHAIN_NAME: ${{ inputs.keychain_name }}
+        KEYCHAIN_PASSWORD: ${{ inputs.keychain_password }}
+        CERTIFICATES_PASSWORD: ${{ inputs.certificates_password }}
+        MAC_INSTALLER_DISTRIBUTION_CERTIFICATE_B64: ${{ inputs.mac_installer_distribution_certificate_b64 }}
+      run: |
+        CERT="${RUNNER_TEMP}/mac_installer_distribution.p12"
+        echo -n "$MAC_INSTALLER_DISTRIBUTION_CERTIFICATE_B64" | base64 -D > "$CERT"
+        security import "$CERT" -P "$CERTIFICATES_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_NAME"
+        security set-key-partition-list -S apple-tool:,apple: -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_NAME"
+
+    - name: Write provisioning profiles (embedded & runtime)
+      shell: bash
+      env:
+        CMP_DESKTOP_DIR: ${{ inputs.cmp_desktop_dir }}
+        MAC_EMBEDDED_PROVISION_B64: ${{ inputs.mac_embedded_provision_b64 }}
+        MAC_RUNTIME_PROVISION_B64: ${{ inputs.mac_runtime_provision_b64 }}
+      run: |
+        echo -n "$MAC_EMBEDDED_PROVISION_B64" | base64 -D > "$CMP_DESKTOP_DIR/embedded.provisionprofile"
+        echo -n "$MAC_RUNTIME_PROVISION_B64" | base64 -D > "$CMP_DESKTOP_DIR/runtime.provisionprofile"
+
+    - name: Write App Store Connect API key (.p8)
+      shell: bash
+      env:
+        APPSTORE_AUTH_KEY_B64: ${{ inputs.appstore_auth_key_b64 }}
+      run: |
+        mkdir -p secrets
+        echo -n "$APPSTORE_AUTH_KEY_B64" | base64 -D > secrets/Auth_key.p8
+
+    - name: Upload to TestFlight
+      shell: bash
+      env:
+        APP_IDENTIFIER: ${{ inputs.app_identifier }}
+        APPSTORE_KEY_ID: ${{ inputs.appstore_key_id }}
+        APPSTORE_ISSUER_ID: ${{ inputs.appstore_issuer_id }}
+      run: |
+        bundle exec fastlane mac desktop_testflight \
+          app_identifier:"$APP_IDENTIFIER" \
+          appstore_key_id:"$APPSTORE_KEY_ID" \
+          appstore_issuer_id:"$APPSTORE_ISSUER_ID" \
+          key_file_path:secrets/Auth_key.p8
+
+    - name: Cleanup keychain
+      if: always()
+      shell: bash
+      env:
+        KEYCHAIN_NAME: ${{ inputs.keychain_name }}
+      run: |
+        security delete-keychain "$KEYCHAIN_NAME" || true
